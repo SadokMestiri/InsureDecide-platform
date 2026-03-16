@@ -1,7 +1,7 @@
 """
-InsureDecide — Service Prophet
-Prévisions temporelles avec fallback robuste multi-méthode.
-Ordre : Prophet → SARIMA → Holt-Winters → Régression poly+saisonnalité
+InsureDecide — Service Prévisions Temporelles
+Méthodes : Holt-Winters (principal) → Régression poly+saisonnalité (fallback)
+Prophet et SARIMA exclus : incompatibilités versions + intervalles instables
 """
 
 import os
@@ -12,138 +12,41 @@ import numpy as np
 from decimal import Decimal
 
 logger = logging.getLogger(__name__)
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://insuredecide_user:insuredecide_pass@postgres:5432/insuredecide")
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://insuredecide_user:insuredecide_pass@postgres:5432/insuredecide"
+)
 
-INDICATEURS_POSITIFS = {
-    "primes_acquises_tnd", "cout_sinistres_tnd",
-    "nb_sinistres", "ratio_combine_pct"
-}
-
-# Valeurs plancher réalistes pour éviter prédictions aberrantes
-FLOOR_VALUES = {
-    "primes_acquises_tnd": 100_000,
-    "cout_sinistres_tnd":  50_000,
-    "nb_sinistres":        10,
-    "ratio_combine_pct":   30.0,
+# Bornes métier réalistes par indicateur
+BOUNDS = {
+    "ratio_combine_pct":    (60.0,   180.0),
+    "primes_acquises_tnd":  (100_000, None),
+    "cout_sinistres_tnd":   (10_000,  None),
+    "nb_sinistres":         (5,       None),
 }
 
 
 def _clean(val):
-    if isinstance(val, Decimal): return float(val)
+    if isinstance(val, Decimal):
+        return float(val)
     return float(val) if val else 0.0
 
 
-def _apply_floor(values: np.ndarray, indicateur: str) -> np.ndarray:
-    """Applique un plancher réaliste selon l'indicateur."""
-    floor = FLOOR_VALUES.get(indicateur, 0)
-    return np.maximum(values, floor)
+def _clip_yhat(values: np.ndarray, indicateur: str) -> np.ndarray:
+    """Applique les bornes métier uniquement sur yhat (pas sur les intervalles)."""
+    lo, hi = BOUNDS.get(indicateur, (0, None))
+    result = np.maximum(values, lo) if lo is not None else values
+    result = np.minimum(result, hi) if hi is not None else result
+    return result
 
 
-def _forecast_with_prophet(df: pd.DataFrame, nb_mois: int, indicateur: str):
-    """Essaie Prophet avec paramètres adaptés à l'indicateur."""
-    try:
-        from prophet import Prophet
-        import warnings
-        warnings.filterwarnings("ignore")
-
-        floor = FLOOR_VALUES.get(indicateur, 0)
-
-        # Paramètres adaptés selon l'indicateur
-        if indicateur == "ratio_combine_pct":
-            # Ratio : plus volatile, changepoints plus flexibles
-            model = Prophet(
-                yearly_seasonality=True,
-                weekly_seasonality=False,
-                daily_seasonality=False,
-                seasonality_mode="additive",
-                changepoint_prior_scale=0.3,
-                seasonality_prior_scale=10,
-            )
-        elif indicateur in ("cout_sinistres_tnd", "nb_sinistres"):
-            # Coût/sinistres : saisonnalité forte
-            model = Prophet(
-                yearly_seasonality=True,
-                weekly_seasonality=False,
-                daily_seasonality=False,
-                seasonality_mode="multiplicative",
-                changepoint_prior_scale=0.1,
-                seasonality_prior_scale=15,
-            )
-        else:
-            # Primes : tendance haussière régulière
-            model = Prophet(
-                yearly_seasonality=True,
-                weekly_seasonality=False,
-                daily_seasonality=False,
-                seasonality_mode="multiplicative",
-                changepoint_prior_scale=0.05,
-            )
-
-        model.fit(df[["ds", "y"]])
-        future = model.make_future_dataframe(periods=nb_mois, freq="MS")
-        forecast = model.predict(future)
-
-        # Appliquer plancher réaliste
-        forecast["yhat"]       = _apply_floor(forecast["yhat"].values, indicateur)
-        forecast["yhat_lower"] = _apply_floor(forecast["yhat_lower"].values, indicateur)
-        forecast["yhat_upper"] = _apply_floor(forecast["yhat_upper"].values, indicateur)
-
-        return forecast, "Prophet"
-
-    except Exception as e:
-        logger.warning(f"Prophet indisponible ({e}), essai SARIMA")
-        return None, None
-
-
-def _forecast_with_sarima(df: pd.DataFrame, nb_mois: int, indicateur: str):
-    """SARIMA(1,1,1)(1,1,1)[12] — capte saisonnalité annuelle."""
-    try:
-        from statsmodels.tsa.statespace.sarimax import SARIMAX
-        import warnings
-        warnings.filterwarnings("ignore")
-
-        y = df["y"].values
-        model = SARIMAX(
-            y,
-            order=(1, 1, 1),
-            seasonal_order=(1, 1, 1, 12),
-            enforce_stationarity=False,
-            enforce_invertibility=False,
-        )
-        result = model.fit(disp=False, maxiter=200)
-
-        forecast_obj = result.get_forecast(steps=nb_mois)
-        yhat   = forecast_obj.predicted_mean
-        ci     = forecast_obj.conf_int(alpha=0.05)
-        lower  = ci.iloc[:, 0].values
-        upper  = ci.iloc[:, 1].values
-
-        last_date    = df["ds"].max()
-        future_dates = pd.date_range(start=last_date + pd.DateOffset(months=1), periods=nb_mois, freq="MS")
-
-        # Historique prédit (in-sample)
-        hist_pred = result.fittedvalues
-
-        all_ds    = pd.concat([df["ds"], pd.Series(future_dates)], ignore_index=True)
-        all_yhat  = np.concatenate([hist_pred, yhat])
-        all_lower = np.concatenate([hist_pred - 1.96 * np.std(hist_pred - y), lower])
-        all_upper = np.concatenate([hist_pred + 1.96 * np.std(hist_pred - y), upper])
-
-        fc = pd.DataFrame({
-            "ds":         all_ds,
-            "yhat":       _apply_floor(all_yhat, indicateur),
-            "yhat_lower": _apply_floor(all_lower, indicateur),
-            "yhat_upper": _apply_floor(all_upper, indicateur),
-        })
-        return fc, "SARIMA(1,1,1)(1,1,1)[12]"
-
-    except Exception as e:
-        logger.warning(f"SARIMA indisponible ({e}), essai Holt-Winters")
-        return None, None
-
-
-def _forecast_with_holtwinters(df: pd.DataFrame, nb_mois: int, indicateur: str):
-    """Holt-Winters (lissage exponentiel triple) avec saisonnalité annuelle."""
+def _forecast_holtwinters(df: pd.DataFrame, nb_mois: int, indicateur: str):
+    """
+    Holt-Winters avec tendance amortie.
+    - Trend amorti : empêche l'extrapolation explosive
+    - Intervalles basés sur std des 12 derniers résidus uniquement
+    - Croissance linéaire de l'incertitude avec l'horizon
+    """
     try:
         from statsmodels.tsa.holtwinters import ExponentialSmoothing
         import warnings
@@ -152,127 +55,152 @@ def _forecast_with_holtwinters(df: pd.DataFrame, nb_mois: int, indicateur: str):
         y = df["y"].values
         n = len(y)
 
-        # Besoin d'au moins 2 cycles saisonniers (24 mois)
         if n < 24:
-            raise ValueError("Données insuffisantes pour Holt-Winters (min 24 mois)")
+            raise ValueError(f"Données insuffisantes : {n} mois (min 24)")
 
         model = ExponentialSmoothing(
             y,
             seasonal_periods=12,
             trend="add",
             seasonal="add",
-            damped_trend=True,
+            damped_trend=True,      # crucial : amortit la tendance dans le futur
+            initialization_method="estimated",
         )
-        result = model.fit(optimized=True)
+        result = model.fit(optimized=True, remove_bias=True)
 
-        yhat_future = result.forecast(nb_mois)
-        yhat_hist   = result.fittedvalues
-        std         = np.std(result.resid)
+        yhat_future = np.array(result.forecast(nb_mois))
+        yhat_hist   = np.array(result.fittedvalues)
+        resid       = y - yhat_hist
+
+        # Std sur les 12 derniers résidus = volatilité récente
+        std_recent = np.std(resid[-12:]) if n >= 12 else np.std(resid)
 
         last_date    = df["ds"].max()
-        future_dates = pd.date_range(start=last_date + pd.DateOffset(months=1), periods=nb_mois, freq="MS")
+        future_dates = pd.date_range(
+            start=last_date + pd.DateOffset(months=1),
+            periods=nb_mois, freq="MS"
+        )
 
-        all_ds    = pd.concat([df["ds"], pd.Series(future_dates)], ignore_index=True)
-        all_yhat  = np.concatenate([yhat_hist, yhat_future])
-        all_lower = all_yhat - 1.96 * std
-        all_upper = all_yhat + 1.96 * std
+        # Intervalles : ±1.96*std pour historique, croissance sqrt pour futur
+        hist_ci    = 1.96 * std_recent
+        future_ci  = np.array([1.96 * std_recent * np.sqrt(1 + i * 0.15)
+                                for i in range(1, nb_mois + 1)])
+
+        all_ds     = pd.concat([df["ds"], pd.Series(future_dates)], ignore_index=True)
+        all_yhat   = np.concatenate([yhat_hist, yhat_future])
+        all_lower  = np.concatenate([yhat_hist - hist_ci, yhat_future - future_ci])
+        all_upper  = np.concatenate([yhat_hist + hist_ci, yhat_future + future_ci])
 
         fc = pd.DataFrame({
             "ds":         all_ds,
-            "yhat":       _apply_floor(all_yhat, indicateur),
-            "yhat_lower": _apply_floor(all_lower, indicateur),
-            "yhat_upper": _apply_floor(all_upper, indicateur),
+            "yhat":       _clip_yhat(all_yhat, indicateur),
+            "yhat_lower": all_lower,   # intervalles libres
+            "yhat_upper": all_upper,
         })
-        return fc, "Holt-Winters (lissage exponentiel)"
+
+        logger.info(f"[HoltWinters] {indicateur} : std_recent={std_recent:.2f}, "
+                    f"prévision J+1={yhat_future[0]:.2f}")
+        return fc, "Holt-Winters (trend amorti)"
 
     except Exception as e:
         logger.warning(f"Holt-Winters indisponible ({e}), fallback régression poly")
         return None, None
 
 
-def _forecast_poly_seasonal(df: pd.DataFrame, nb_mois: int, indicateur: str):
+def _forecast_poly(df: pd.DataFrame, nb_mois: int, indicateur: str):
     """
-    Fallback final : régression polynomiale degré 2 + saisonnalité mensuelle sin/cos.
-    Toujours disponible, sans dépendances externes.
+    Fallback : Ridge polynomial degré 2 + saisonnalité sin/cos (3 harmoniques).
+    Entraîné sur les 24 derniers mois pour capter la dynamique récente.
     """
     from sklearn.linear_model import Ridge
     import warnings
     warnings.filterwarnings("ignore")
 
-    df = df.copy()
-    n  = len(df)
-    df["t"]     = np.arange(n)
-    df["t2"]    = df["t"] ** 2
-    df["mois"]  = df["ds"].dt.month
+    # Utiliser les 24 derniers mois pour la régression
+    df_fit = df.tail(24).reset_index(drop=True).copy()
+    n      = len(df_fit)
 
-    # Saisonnalité complète (6 harmoniques)
+    df_fit["t"]  = np.arange(n, dtype=float)
+    df_fit["t2"] = df_fit["t"] ** 2
+    df_fit["m"]  = df_fit["ds"].dt.month.astype(float)
+
     for k in range(1, 4):
-        df[f"sin_{k}"] = np.sin(2 * np.pi * k * df["mois"] / 12)
-        df[f"cos_{k}"] = np.cos(2 * np.pi * k * df["mois"] / 12)
+        df_fit[f"s{k}"] = np.sin(2 * np.pi * k * df_fit["m"] / 12)
+        df_fit[f"c{k}"] = np.cos(2 * np.pi * k * df_fit["m"] / 12)
 
-    features = ["t", "t2"] + [f"sin_{k}" for k in range(1,4)] + [f"cos_{k}" for k in range(1,4)]
-    X = df[features].values
-    y = df["y"].values
+    feats = ["t", "t2", "s1", "c1", "s2", "c2", "s3", "c3"]
+    X     = df_fit[feats].values
+    y     = df_fit["y"].values
 
-    reg = Ridge(alpha=1.0).fit(X, y)
-    std = np.std(reg.predict(X) - y)
+    # Alpha fort pour ratio (régresser vers moyenne) faible pour autres
+    alpha = 50.0 if indicateur == "ratio_combine_pct" else 1.0
+    reg   = Ridge(alpha=alpha).fit(X, y)
+
+    resid      = y - reg.predict(X)
+    std_resid  = np.std(resid)
 
     last_date    = df["ds"].max()
-    future_dates = pd.date_range(start=last_date + pd.DateOffset(months=1), periods=nb_mois, freq="MS")
+    future_dates = pd.date_range(
+        start=last_date + pd.DateOffset(months=1),
+        periods=nb_mois, freq="MS"
+    )
 
-    t_fut  = np.arange(n, n + nb_mois)
-    t2_fut = t_fut ** 2
-    m_fut  = future_dates.month
+    t_fut  = np.arange(n, n + nb_mois, dtype=float)
+    m_fut  = future_dates.month.astype(float)
+    X_fut  = np.column_stack([
+        t_fut, t_fut**2,
+        *[np.sin(2 * np.pi * k * m_fut / 12) for k in range(1, 4)],
+        *[np.cos(2 * np.pi * k * m_fut / 12) for k in range(1, 4)],
+    ])
 
-    X_fut_rows = [t_fut, t2_fut]
-    for k in range(1, 4):
-        X_fut_rows.append(np.sin(2 * np.pi * k * m_fut / 12))
-        X_fut_rows.append(np.cos(2 * np.pi * k * m_fut / 12))
-    X_future = np.column_stack(X_fut_rows)
-
-    # Reconstruire dans le bon ordre de features
-    X_future_df = pd.DataFrame({
-        "t": t_fut, "t2": t2_fut,
-        **{f"sin_{k}": np.sin(2 * np.pi * k * m_fut / 12) for k in range(1,4)},
-        **{f"cos_{k}": np.cos(2 * np.pi * k * m_fut / 12) for k in range(1,4)},
-    })
-    yhat_future = reg.predict(X_future_df[features].values)
+    yhat_future = reg.predict(X_fut)
     yhat_hist   = reg.predict(X)
 
+    future_ci = np.array([1.96 * std_resid * np.sqrt(1 + i * 0.15)
+                           for i in range(1, nb_mois + 1)])
+
+    # Pour l'historique complet (pas seulement les 24 derniers)
+    n_full   = len(df)
+    n_ancien = n_full - n  # points avant les 24 derniers
+
     all_ds    = pd.concat([df["ds"], pd.Series(future_dates)], ignore_index=True)
-    all_yhat  = np.concatenate([yhat_hist, yhat_future])
-    all_lower = all_yhat - 1.96 * std
-    all_upper = all_yhat + 1.96 * std
+    # Points anciens : valeurs réelles (pas de prédiction)
+    all_yhat  = np.concatenate([df["y"].values[:n_ancien], yhat_hist, yhat_future])
+    all_lower = np.concatenate([
+        df["y"].values[:n_ancien],
+        yhat_hist - 1.96 * std_resid,
+        yhat_future - future_ci,
+    ])
+    all_upper = np.concatenate([
+        df["y"].values[:n_ancien],
+        yhat_hist + 1.96 * std_resid,
+        yhat_future + future_ci,
+    ])
 
     fc = pd.DataFrame({
         "ds":         all_ds,
-        "yhat":       _apply_floor(all_yhat, indicateur),
-        "yhat_lower": _apply_floor(all_lower, indicateur),
-        "yhat_upper": _apply_floor(all_upper, indicateur),
+        "yhat":       _clip_yhat(all_yhat, indicateur),
+        "yhat_lower": all_lower,
+        "yhat_upper": all_upper,
     })
+
+    logger.info(f"[PolyReg] {indicateur} : std={std_resid:.2f}, "
+                f"prévision J+1={yhat_future[0]:.2f}")
     return fc, "Régression poly+saisonnalité"
 
 
 def _run_forecast(df: pd.DataFrame, nb_mois: int, indicateur: str):
-    """
-    Cascade de méthodes :
-    1. Prophet
-    2. SARIMA
-    3. Holt-Winters
-    4. Régression poly+saisonnalité (toujours disponible)
-    """
-    for fn in [_forecast_with_prophet, _forecast_with_sarima, _forecast_with_holtwinters]:
-        fc, methode = fn(df, nb_mois, indicateur)
-        if fc is not None:
-            return fc, methode
-
-    return _forecast_poly_seasonal(df, nb_mois, indicateur)
+    """Holt-Winters → Régression poly (fallback)."""
+    fc, methode = _forecast_holtwinters(df, nb_mois, indicateur)
+    if fc is not None:
+        return fc, methode
+    return _forecast_poly(df, nb_mois, indicateur)
 
 
 def get_forecast(
     departement: str = "Automobile",
-    indicateur: str = "primes_acquises_tnd",
-    nb_mois: int = 6,
+    indicateur: str  = "primes_acquises_tnd",
+    nb_mois: int     = 6,
 ) -> dict:
     conn = psycopg2.connect(DATABASE_URL)
     cur  = conn.cursor()
@@ -295,39 +223,58 @@ def get_forecast(
     cur.close()
     conn.close()
 
-    if len(rows) < 12:
-        return {"error": "Données insuffisantes pour la prévision (minimum 12 mois requis)"}
+    if len(rows) < 24:
+        return {"error": "Données insuffisantes (minimum 24 mois requis)"}
 
-    df      = pd.DataFrame(rows, columns=["annee", "mois", "y"])
-    df["ds"] = pd.to_datetime(df.apply(lambda r: f"{int(r.annee)}-{int(r.mois):02d}-01", axis=1))
+    df       = pd.DataFrame(rows, columns=["annee", "mois", "y"])
+    df["ds"] = pd.to_datetime(
+        df.apply(lambda r: f"{int(r.annee)}-{int(r.mois):02d}-01", axis=1)
+    )
     df["y"]  = df["y"].apply(_clean)
 
-    forecast, methode = _run_forecast(df, nb_mois, indicateur)
+    # Pour ratio_combine_pct : utiliser seulement 2022-2024
+    # Les données 2020-2021 sont une phase de transition (150-400%)
+    # qui biaise les modèles de prévision vers une tendance haussière fausse
+    if indicateur == "ratio_combine_pct":
+        df_model = df[df["annee"] >= 2022].reset_index(drop=True)
+        if len(df_model) < 24:
+            df_model = df.tail(24).reset_index(drop=True)
+        logger.info(f"[Forecast] ratio_combine_pct : {len(df_model)} mois utilisés (>= 2022)")
+    else:
+        df_model = df
+
+    forecast, methode = _run_forecast(df_model, nb_mois, indicateur)
 
     historique = [
-        {"periode": row.ds.strftime("%Y-%m"), "valeur": round(float(row.y), 2), "type": "reel"}
+        {
+            "periode": row.ds.strftime("%Y-%m"),
+            "valeur":  round(float(row.y), 2),
+            "type":    "reel",
+        }
         for _, row in df.iterrows()
     ]
 
-    ds_max      = df["ds"].max()
+    ds_max      = df_model["ds"].max()
     future_rows = forecast[forecast["ds"] > ds_max]
 
     previsions = [
         {
             "periode":    row.ds.strftime("%Y-%m"),
             "valeur":     round(float(row.yhat), 2),
-            "valeur_min": round(float(row.yhat_lower), 2),
-            "valeur_max": round(float(row.yhat_upper), 2),
+            "valeur_min": round(float(row.yhat_lower), 1),
+            "valeur_max": round(float(row.yhat_upper), 1),
             "type":       "prevision",
         }
         for _, row in future_rows.iterrows()
     ]
 
-    dernier_reel  = float(df["y"].iloc[-1])
+    dernier_reel  = float(df["y"].iloc[-1])  # dernière valeur réelle (historique complet)
     premiere_prev = previsions[0]["valeur"] if previsions else dernier_reel
-    tendance      = "hausse" if premiere_prev > dernier_reel * 1.02 else \
-                    "baisse" if premiere_prev < dernier_reel * 0.98 else "stable"
-    variation_pct = round((premiere_prev - dernier_reel) / dernier_reel * 100, 1) if dernier_reel else 0
+    tendance      = ("hausse" if premiere_prev > dernier_reel * 1.02 else
+                     "baisse" if premiere_prev < dernier_reel * 0.98 else "stable")
+    variation_pct = round(
+        (premiere_prev - dernier_reel) / dernier_reel * 100, 1
+    ) if dernier_reel else 0
 
     return {
         "departement":      departement,
