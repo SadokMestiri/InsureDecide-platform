@@ -1,0 +1,44 @@
+{
+  "projet": "InsureDecide",
+  "generation_date": "2026-03-09T10:31:39.736064",
+  "periode_couverte": "2020-2024 (5 ans)",
+  "departements": [
+    "Automobile",
+    "Vie",
+    "Immobilier"
+  ],
+  "volumes": {
+    "clients": 60000,
+    "contrats_automobile": 40000,
+    "contrats_vie": 25000,
+    "contrats_immobilier": 20000,
+    "total_contrats": 85000,
+    "sinistres_automobile": 8107,
+    "sinistres_vie": 1035,
+    "sinistres_immobilier": 2063,
+    "total_sinistres": 11205,
+    "lignes_provisions": 180,
+    "lignes_kpis": 180
+  },
+  "kpis_disponibles": [
+    "ratio_combine_pct",
+    "primes_acquises_tnd",
+    "cout_sinistres_tnd",
+    "frequence_sinistres_pct",
+    "cout_moyen_sinistre_tnd",
+    "taux_resiliation_pct",
+    "provision_totale_tnd",
+    "nb_suspicions_fraude"
+  ],
+  "fichiers": [
+    "clients.csv",
+    "contrats_automobile.csv",
+    "contrats_vie.csv",
+    "contrats_immobilier.csv",
+    "sinistres_automobile.csv",
+    "sinistres_vie.csv",
+    "sinistres_immobilier.csv",
+    "provisions.csv",
+    "kpis_mensuels.csv"
+  ]
+}
