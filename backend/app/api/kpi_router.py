@@ -166,11 +166,15 @@ def dashboard_complet(
     mois: Optional[int] = Query(None, ge=1, le=12),
     db: Session = Depends(get_db)
 ):
+    summary = kpi_service.get_summary(db, annee, mois)
+    par_departement = kpi_service.get_kpis_par_departement(db, annee, mois)
+    alertes = kpi_service.get_alertes(db)
     return DashboardResponse(
-        summary=kpi_service.get_summary(db, annee, mois),
-        par_departement=kpi_service.get_kpis_par_departement(db, annee, mois),
-        alertes=kpi_service.get_alertes(db),
+        summary=summary,
+        par_departement=par_departement,
+        alertes=alertes,
         derniere_mise_a_jour=datetime.now().isoformat(),
+        source=summary.source,
     )
 
 

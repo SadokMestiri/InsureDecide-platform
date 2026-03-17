@@ -13,6 +13,7 @@ from langchain_core.tools import tool
 from qdrant_client import QdrantClient
 from fastembed import TextEmbedding
 import psycopg2
+from app.denodo_client import get_kpis_enrichis
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,18 @@ def get_pg():
     return psycopg2.connect(DATABASE_URL)
 
 
+def _denodo_kpi_rows():
+    try:
+        result = get_kpis_enrichis(None)
+        if result.get("source") != "denodo":
+            return []
+        rows = result.get("data") or []
+        return [r for r in rows if r.get("departement")]
+    except Exception as e:
+        logger.warning(f"[Denodo] agent fallback PostgreSQL: {e}")
+        return []
+
+
 # ══════════════════════════════════════════════════
 # OUTIL 1 — KPI SQL
 # ══════════════════════════════════════════════════
@@ -55,6 +68,51 @@ def kpi_tool(question: str) -> str:
     classements, totaux, moyennes.
     """
     try:
+        denodo_rows = _denodo_kpi_rows()
+        if denodo_rows:
+            # Dernière période
+            latest = max(denodo_rows, key=lambda r: (int(r.get("annee", 0)), int(r.get("mois", 0))))
+            y, m = int(latest.get("annee", 0)), int(latest.get("mois", 0))
+            last_period = [r for r in denodo_rows if int(r.get("annee", 0)) == y and int(r.get("mois", 0)) == m]
+
+            context = "=== DONNÉES KPIS INSUREDECIDE — DERNIÈRE PÉRIODE (DENODO) ===\n\n"
+            for r in sorted(last_period, key=lambda x: x.get("departement", "")):
+                dept = r.get("departement", "Inconnu")
+                periode = r.get("periode", "")
+                contrats = int(r.get("nb_contrats_actifs", r.get("nb_contrats", 0)) or 0)
+                primes = float(r.get("primes_acquises_tnd", 0) or 0)
+                cout_sin = float(r.get("cout_sinistres_tnd", 0) or 0)
+                nb_sin = int(r.get("nb_sinistres", 0) or 0)
+                ratio = float(r.get("ratio_combine_pct", 0) or 0)
+                resil = float(r.get("taux_resiliation_pct", 0) or 0)
+                provision = float(r.get("provision_totale_tnd", 0) or 0)
+                fraudes = int(r.get("nb_suspicions_fraude", 0) or 0)
+                cout_moy = (cout_sin / nb_sin) if nb_sin > 0 else float(r.get("cout_moyen_sinistre_tnd", 0) or 0)
+
+                context += (
+                    f"DÉPARTEMENT {dept} — {periode}\n"
+                    f"  Contrats actifs      : {contrats:,}\n"
+                    f"  Primes acquises      : {primes:,.0f} TND\n"
+                    f"  Coût sinistres       : {cout_sin:,.0f} TND\n"
+                    f"  Nombre sinistres     : {int(nb_sin)}\n"
+                    f"  Coût moyen sinistre  : {cout_moy:,.0f} TND\n"
+                    f"  Ratio combiné        : {ratio:.1f}%\n"
+                    f"  Taux résiliation     : {resil:.1f}%\n"
+                    f"  Provisions           : {provision:,.0f} TND\n"
+                    f"  Suspicions fraude    : {int(fraudes)}\n\n"
+                )
+
+            evolution = sorted(denodo_rows, key=lambda r: (int(r.get("annee", 0)), int(r.get("mois", 0))), reverse=True)[:12]
+            context += "=== ÉVOLUTION RÉCENTE (12 DERNIERS MOIS) ===\n"
+            for r in evolution:
+                dept = r.get("departement", "Inconnu")
+                periode = r.get("periode", "")
+                ratio = float(r.get("ratio_combine_pct", 0) or 0)
+                primes = float(r.get("primes_acquises_tnd", 0) or 0)
+                resil = float(r.get("taux_resiliation_pct", 0) or 0)
+                context += f"  {dept} {periode} → RC:{ratio:.1f}% | Primes:{primes:,.0f} | Résil:{resil:.1f}%\n"
+            return context
+
         conn = get_pg()
         cur  = conn.cursor()
 
@@ -179,6 +237,37 @@ def alerte_tool(nb_mois: int = 3) -> str:
     situations critiques, recommandations d'actions urgentes.
     """
     try:
+        denodo_rows = _denodo_kpi_rows()
+        if denodo_rows:
+            rows = sorted(denodo_rows, key=lambda r: (int(r.get("annee", 0)), int(r.get("mois", 0))))
+            months = sorted({(int(r.get("annee", 0)), int(r.get("mois", 0))) for r in rows})
+            keep = set(months[-(nb_mois + 1):]) if months else set()
+            rows = [r for r in rows if (int(r.get("annee", 0)), int(r.get("mois", 0))) in keep]
+
+            alertes = []
+            for r in rows:
+                dept = r.get("departement", "Inconnu")
+                periode = r.get("periode", "")
+                ratio = float(r.get("ratio_combine_pct", 0) or 0)
+                resil = float(r.get("taux_resiliation_pct", 0) or 0)
+                fraudes = int(r.get("nb_suspicions_fraude", 0) or 0)
+                if ratio > 110:
+                    alertes.append(f"🔴 CRITIQUE — {dept} {periode} : ratio combiné {ratio:.1f}% (seuil 110%)")
+                elif ratio > 95:
+                    alertes.append(f"🟡 WARNING  — {dept} {periode} : ratio combiné {ratio:.1f}% (seuil 95%)")
+                if resil > 15:
+                    alertes.append(f"🔴 CRITIQUE — {dept} {periode} : résiliation {resil:.1f}% (seuil 15%)")
+                if fraudes >= 5:
+                    alertes.append(f"🟡 WARNING  — {dept} {periode} : {int(fraudes)} suspicions fraude (seuil 5)")
+
+            if not alertes:
+                return "✅ Aucune anomalie détectée sur les derniers mois. Tous les indicateurs sont dans les seuils normaux."
+
+            context = f"=== ALERTES ACTIVES — {nb_mois} DERNIERS MOIS (DENODO) ===\n\n"
+            context += "\n".join(alertes)
+            context += f"\n\nTotal : {len(alertes)} alerte(s) détectée(s)."
+            return context
+
         conn = get_pg()
         cur  = conn.cursor()
 

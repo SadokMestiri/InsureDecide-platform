@@ -34,6 +34,7 @@ class KPISummary(BaseModel):
     total_provisions_tnd: float
     total_suspicions_fraude: int
     periode_label: str
+    source: Optional[str] = None
 
 # ── KPI par département (dernière période)
 class KPIDepartement(BaseModel):
@@ -51,6 +52,7 @@ class KPIDepartement(BaseModel):
     nb_suspicions_fraude: int
     tendance_ratio: Optional[str] = None   # "hausse" | "baisse" | "stable"
     variation_ratio_pct: Optional[float] = None
+    source: Optional[str] = None
 
 # ── Point de données pour graphique temporel
 class EvolutionPoint(BaseModel):
@@ -66,6 +68,7 @@ class EvolutionResponse(BaseModel):
     unite: str
     departements: List[str]
     series: List[EvolutionPoint]
+    source: Optional[str] = None
 
 # ── Point comparaison barres
 class ComparaisonPoint(BaseModel):
@@ -77,6 +80,7 @@ class ComparaisonPoint(BaseModel):
     taux_resiliation_pct: float
     nb_sinistres: int
     nb_contrats_actifs: int
+    source: Optional[str] = None
 
 # ── Alerte anomalie
 class Alerte(BaseModel):
@@ -89,6 +93,7 @@ class Alerte(BaseModel):
     seuil: float
     periode: str
     recommandation: str
+    source: Optional[str] = None
 
 # ── Réponse dashboard principal
 class DashboardResponse(BaseModel):
@@ -96,3 +101,4 @@ class DashboardResponse(BaseModel):
     par_departement: List[KPIDepartement]
     alertes: List[Alerte]
     derniere_mise_a_jour: str
+    source: Optional[str] = None

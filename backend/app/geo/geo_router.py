@@ -23,7 +23,8 @@ async def geo_sinistres(departement: Optional[str] = Query(None)):
     loop = asyncio.get_event_loop()
     from app.geo.geo_service import get_sinistres_par_gouvernorat
     data = await loop.run_in_executor(None, get_sinistres_par_gouvernorat, departement)
-    return {"gouvernorats": data, "total": len(data)}
+    source = data[0].get("source", "unknown") if data else "unknown"
+    return {"gouvernorats": data, "total": len(data), "source": source}
 
 
 @router.get("/api/geo/sinistres/top")
@@ -34,7 +35,8 @@ async def geo_top(
     loop = asyncio.get_event_loop()
     from app.geo.geo_service import get_top_gouvernorats
     data = await loop.run_in_executor(None, get_top_gouvernorats, departement, limit)
-    return {"top": data}
+    source = data[0].get("source", "unknown") if data else "unknown"
+    return {"top": data, "source": source}
 
 
 @router.get("/api/geo/gouvernorat/{gouvernorat}")
