@@ -299,6 +299,10 @@ services:
       AWS_SECRET_ACCESS_KEY: insuredecide_minio_pass
       MLFLOW_S3_ENDPOINT_URL: http://minio:9000
       MLFLOW_TRACKING_URI: http://mlflow:5000
+      DENODO_URL: http://172.16.60.6:9090
+      DENODO_USER: admin
+      DENODO_PASSWORD: admin
+      DENODO_DB: insuredecide
     ports:
       - "8000:8000"
     volumes:

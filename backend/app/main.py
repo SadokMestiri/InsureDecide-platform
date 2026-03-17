@@ -12,6 +12,7 @@ from app.ml.ml_router import router as ml_router
 from app.geo.geo_router import router as geo_router
 from app.events.events_service import refresh_events
 
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,8 @@ app.include_router(agent_router)
 app.include_router(events_router)
 app.include_router(ml_router)
 app.include_router(geo_router)
+from app.routers.client360_router import router as denodo_router
+app.include_router(denodo_router, prefix="/api/denodo", tags=["Denodo"])
 
 
 @app.get("/", tags=["Santé"])
