@@ -271,3 +271,24 @@ async def preprocessing_report():
     except Exception as e:
         logger.error(f"Erreur preprocessing report: {e}")
         return {"status": "error", "detail": str(e)}
+
+
+# ══════════════════════════════════════════════
+# SEGMENTATION CLIENTS — KMeans
+# ══════════════════════════════════════════════
+
+# ── GET /api/ml/segmentation
+@router.get("/api/ml/segmentation")
+async def segmentation_clients(n_clusters: int = 4, limit_clients: int = 20000):
+    """
+    Segmentation client par clustering K-Means.
+    Retourne les profils de segments et un aperçu des clients clés.
+    """
+    try:
+        from app.ml.segmentation_service import get_client_segmentation
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, get_client_segmentation, n_clusters, limit_clients)
+        return result
+    except Exception as e:
+        logger.error(f"Erreur segmentation: {e}")
+        return {"status": "error", "detail": str(e)}

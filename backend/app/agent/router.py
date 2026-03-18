@@ -34,10 +34,35 @@ class ChatResponse(BaseModel):
     answer:     str
     tools_used: List[str]
     steps:      List[str]
+    charts:     Optional[list] = []
+    intent:     Optional[str] = None
+    intent_confidence: Optional[float] = None
 
 class IndexResponse(BaseModel):
     status:  str
     message: str
+
+
+class SmokeCaseResult(BaseModel):
+    name: str
+    question: str
+    expected_intent: str
+    got_intent: Optional[str] = None
+    expected_tool: str
+    tool_ok: bool
+    expected_chart: bool
+    chart_ok: bool
+    intent_ok: bool
+    passed: bool
+    steps: List[str] = []
+
+
+class SmokeEvalResponse(BaseModel):
+    status: str
+    passed: int
+    total: int
+    success_rate: float
+    details: List[SmokeCaseResult]
 
 
 # ══════════════════════════════════════════════════
@@ -115,3 +140,116 @@ async def agent_status():
 
     status["ready"] = status["ollama"] and status["qdrant"]
     return status
+
+
+@router.get("/eval/smoke", response_model=SmokeEvalResponse)
+async def agent_eval_smoke():
+    """
+    Exécute un smoke test de l'orchestrateur IA sur des prompts canoniques.
+    Vérifie : intent, outil spécialiste, chart attendu.
+    """
+    cases = [
+        {
+            "name": "forecast",
+            "question": "Fais une prevision des primes automobile pour 6 mois avec visualisation",
+            "expected_intent": "forecast",
+            "expected_tool": "forecast_tool",
+            "expected_chart": True,
+        },
+        {
+            "name": "anomaly",
+            "question": "Detecte les anomalies recentes sur le departement Vie avec visualisation",
+            "expected_intent": "anomaly",
+            "expected_tool": "anomaly_tool",
+            "expected_chart": True,
+        },
+        {
+            "name": "drift",
+            "question": "Montre moi le drift data de l automobile avec visualisation",
+            "expected_intent": "drift",
+            "expected_tool": "drift_tool",
+            "expected_chart": True,
+        },
+        {
+            "name": "explain",
+            "question": "Explique le modele fraude avec shap et visualisation",
+            "expected_intent": "explain",
+            "expected_tool": "explain_tool",
+            "expected_chart": True,
+        },
+        {
+            "name": "segmentation",
+            "question": "Segmente mes clients en 4 clusters et montre les segments",
+            "expected_intent": "segmentation",
+            "expected_tool": "segmentation_tool",
+            "expected_chart": True,
+        },
+        {
+            "name": "client_top",
+            "question": "Donne le top 3 clients avec le plus de sinistres",
+            "expected_intent": "client",
+            "expected_tool": "client_tool",
+            "expected_chart": True,
+        },
+    ]
+
+    results: List[SmokeCaseResult] = []
+    for c in cases:
+        try:
+            res = await invoke_agent(c["question"], history=[], skip_llm=True)
+            steps = res.get("steps", [])
+            tools_used = res.get("tools_used", [])
+            charts = res.get("charts", [])
+
+            tool_ok = (
+                c["expected_tool"] in tools_used
+                and any(s == f"{c['expected_tool']} : OK" for s in steps)
+            )
+            chart_ok = (len(charts) > 0) if c["expected_chart"] else True
+            got_intent = res.get("intent")
+            intent_ok = got_intent == c["expected_intent"]
+            passed = tool_ok and chart_ok and intent_ok
+
+            results.append(
+                SmokeCaseResult(
+                    name=c["name"],
+                    question=c["question"],
+                    expected_intent=c["expected_intent"],
+                    got_intent=got_intent,
+                    expected_tool=c["expected_tool"],
+                    tool_ok=tool_ok,
+                    expected_chart=c["expected_chart"],
+                    chart_ok=chart_ok,
+                    intent_ok=intent_ok,
+                    passed=passed,
+                    steps=steps,
+                )
+            )
+        except Exception as e:
+            results.append(
+                SmokeCaseResult(
+                    name=c["name"],
+                    question=c["question"],
+                    expected_intent=c["expected_intent"],
+                    got_intent=None,
+                    expected_tool=c["expected_tool"],
+                    tool_ok=False,
+                    expected_chart=c["expected_chart"],
+                    chart_ok=False,
+                    intent_ok=False,
+                    passed=False,
+                    steps=[f"Erreur smoke: {str(e)}"],
+                )
+            )
+
+    passed = sum(1 for r in results if r.passed)
+    total = len(results)
+    success_rate = round((passed / total) * 100, 1) if total else 0.0
+
+    return SmokeEvalResponse(
+        status="ok" if passed == total else "warning",
+        passed=passed,
+        total=total,
+        success_rate=success_rate,
+        details=results,
+    )
